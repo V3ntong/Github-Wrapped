@@ -1,61 +1,109 @@
 import { NextResponse } from "next/server";
-import type { Request } from "express";
+import type { Request } from "next";
 
-import GitHubClient from "../../lib/github/client";
-import { validateUsername } from "../../lib/validation";
-import { checkRateLimit, getClientIp } from "../../lib/rate-limit";
-import { computeStats } from "../../lib/stats/index";
+import { validateUsername, yearSchema } from "@/lib/validation";
+import { checkRateLimit, getClientIp } from "@/lib/rate-limit";
+import { GitHubClient } from "@/lib/github/client";
+import { GitHubApiError } from "@/lib/github/errors";
 
 const RATE_LIMIT_KEY = "api-wrapped";
 
+interface RepoContributionShort {
+  name: string;
+  nameWithOwner: string;
+  url: string;
+  isFork: boolean;
+  commits: number;
+}
+
+interface CommitContribution {
+  contributions: { totalCount: number };
+  repository: {
+    name: string;
+    nameWithOwner: string;
+    url: string;
+    isFork: boolean;
+  };
+}
+
+function buildRepos(contributions: CommitContribution[] | null): RepoContributionShort[] {
+  if (!contributions) return [];
+  return contributions
+    .map((c) => ({
+      name: c.repository?.name ?? "",
+      nameWithOwner: c.repository?.nameWithOwner ?? "",
+      url: c.repository?.url ?? "",
+      isFork: c.repository?.isFork ?? false,
+      commits: c.contributions?.totalCount ?? 0,
+    }))
+    .filter((r) => r.commits > 0);
+}
+
+function errorJson(status: number, message: string, resetAt?: Date): NextResponse {
+  const body: Record<string, unknown> = { error: message };
+  if (resetAt) {
+    body.retryAfter = Math.ceil(resetAt.getTime() / 1000);
+  }
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
 export async function GET(
   request: Request,
-  { params }: { params: { username: string } }
+  { params }: { params: Promise<{ username: string }> }
 ) {
-  const username = params.username;
-  const yearParam = new URL(request.url).searchParams.get("year");
+  const { username } = await params;
 
   // Validate username
-  const validation = validateUsername(username);
-  if (!validation.success) {
-    return NextJSONError(400, validation.error);
+  const usernameValidation = validateUsername(username);
+  if (!usernameValidation.success) {
+    return errorJson(400, usernameValidation.error);
+  }
+
+  // Check GitHub token
+  if (!process.env.GITHUB_TOKEN) {
+    return errorJson(
+      500,
+      "MISSING_TOKEN. Set GITHUB_TOKEN in .env.local.",
+    );
+  }
+
+  // Read and validate year
+  const yearParam = new URL(request.url).searchParams.get("year");
+  let year = new Date().getUTCFullYear();
+  if (yearParam) {
+    const yearResult = yearSchema.safeParse(Number(yearParam));
+    if (!yearResult.success) {
+      return errorJson(400, "Invalid year parameter.");
+    }
+    year = yearResult.data;
   }
 
   // IP-based rate limit (simple in-memory)
   const ip = getClientIp(request);
   const { allowed } = checkRateLimit(`${RATE_LIMIT_KEY}:${ip}`);
   if (!allowed) {
-    const resetAt = checkRateLimit(`${RATE_LIMIT_KEY}:${ip}`, 30, 60_000).resetAt;
-    return NextJSONError(429, "Rate limited. Please try again later.", resetAt);
-  }
-
-  // Validate and resolve year
-  let year = new Date().getUTCFullYear();
-  if (yearParam) {
-    const yearResult = validateYearSchema.safeParse(Number(yearParam));
-    if (!yearResult.success) {
-      return NextJSONError(400, "Invalid year parameter.");
-    }
-    year = yearResult.data;
+    const resetResult = checkRateLimit(`${RATE_LIMIT_KEY}:${ip}`, 30, 60_000);
+    return errorJson(
+      429,
+      "Rate limited. Please try again later.",
+      resetResult.resetAt,
+    );
   }
 
   // Fetch from GitHub
   try {
-    const githubResult = await GitHubClient.getWrappedData(
-      validation.username,
-      year
-    );
-    if (!githubResult.data?.user) {
-      return NextJSONError(404, "User not found on GitHub.");
-    }
+    const githubResult = await GitHubClient.getWrappedData(username, year);
 
     // Map raw data to StatsInput
-    const collection = githubResult.data.user.contributionsCollection;
+    const collection = githubResult.data?.user?.contributionsCollection;
     const days = collection?.contributionCalendar?.weeks?.flatMap(
       (w) => w.contributionDays ?? []
     ) ?? [];
 
-    const input: Parameters<typeof computeStats>[0] = {
+    const input = {
       year: githubResult.year,
       days,
       commits: collection?.totalCommitContributions ?? 0,
@@ -70,7 +118,7 @@ export async function GET(
     const payload = {
       stats,
       profile: {
-        login: githubResult.data.user.login ?? validation.username,
+        login: githubResult.data.user.login ?? username,
         name: githubResult.data.user.name ?? null,
         avatarUrl: githubResult.data.user.avatarUrl ?? null,
         followers: githubResult.data.user.followers?.totalCount ?? 0,
@@ -89,51 +137,24 @@ export async function GET(
     );
     return response;
   } catch (err) {
-    if (err instanceof Error && err.name === "GitHubApiError") {
-      const apiErr = err as any; // hacky but we dont import GitHubApiError here explicitly maybe
-      switch (apiErr.code) {
+    if (err instanceof GitHubApiError) {
+      switch (err.code) {
         case "USER_NOT_FOUND":
-          return NextJSONError(404, apiErr.message);
+          return errorJson(404, err.message);
         case "RATE_LIMITED":
-          return NextJSONError(429, apiErr.message, apiErr.retryAfter);
+          return errorJson(
+            429,
+            err.message,
+            err.retryAfter,
+          );
         case "UNAUTHORIZED":
         case "UPSTREAM_ERROR":
-          return NextJSONError(502, apiErr.message);
+          return errorJson(502, err.message);
         default:
-          return NextJSONError(502, apiErr.message);
+          return errorJson(502, err.message);
       }
     }
     // Generic error
-    return NextJSONError(500, "Unexpected error. Please try again later.");
+    return errorJson(500, "Unexpected error. Please try again later.");
   }
-}
-
-function NextJSONError(status: number, message: string, resetAt?: Date) {
-  const body = { error: message };
-  if (resetAt) {
-    body.retryAfter = Math.ceil(resetAt.getTime() / 1000);
-  }
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "Content-Type": "application/json" },
-  });
-}
-
-function validateYearSchema(year: number): year is number {
-  return Number.isInteger(year) && year >= 2008 && year <= 2026;
-}
-
-function buildRepos(
-  contributions: any[] | null
-): { name: string; nameWithOwner: string; url: string; isFork: boolean; commits: number }[] {
-  if (!contributions) return [];
-  return contributions
-    .map((c) => ({
-      name: c.repository?.name ?? "",
-      nameWithOwner: c.repository?.nameWithOwner ?? "",
-      url: c.repository?.url ?? "",
-      isFork: c.repository?.isFork ?? false,
-      commits: c.contributions?.totalCount ?? 0,
-    }))
-    .filter((r) => r.commits > 0);
 }
